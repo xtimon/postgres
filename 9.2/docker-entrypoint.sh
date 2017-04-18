@@ -27,19 +27,38 @@ if [ "${1:0:1}" = '-' ]; then
 	set -- postgres "$@"
 fi
 
+# allow the container to be started with `--user`
+if [ "$1" = 'postgres' ] && [ "$(id -u)" = '0' ]; then
+	mkdir -p "$PGDATA"
+	chown -R postgres "$PGDATA"
+	chmod 700 "$PGDATA"
+
+	mkdir -p /var/run/postgresql
+	chown -R postgres /var/run/postgresql
+	chmod g+s /var/run/postgresql
+
+	# Create the transaction log directory before initdb is run (below) so the directory is owned by the correct user
+	if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+		mkdir -p "$POSTGRES_INITDB_XLOGDIR"
+		chown -R postgres "$POSTGRES_INITDB_XLOGDIR"
+		chmod 700 "$POSTGRES_INITDB_XLOGDIR"
+	fi
+
+	exec gosu postgres "$BASH_SOURCE" "$@"
+fi
+
 if [ "$1" = 'postgres' ]; then
 	mkdir -p "$PGDATA"
-	chmod 700 "$PGDATA"
-	chown -R postgres "$PGDATA"
-
-	mkdir -p /run/postgresql
-	chmod g+s /run/postgresql
-	chown -R postgres /run/postgresql
+	chown -R "$(id -u)" "$PGDATA" 2>/dev/null || :
+	chmod 700 "$PGDATA" 2>/dev/null || :
 
 	# look specifically for PG_VERSION, as it is expected in the DB dir
 	if [ ! -s "$PGDATA/PG_VERSION" ]; then
 		file_env 'POSTGRES_INITDB_ARGS'
-		eval "gosu postgres initdb $POSTGRES_INITDB_ARGS"
+		if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+			export POSTGRES_INITDB_ARGS="$POSTGRES_INITDB_ARGS --xlogdir $POSTGRES_INITDB_XLOGDIR"
+		fi
+		eval "initdb --username=postgres $POSTGRES_INITDB_ARGS"
 
 		authMethod=trust
 		if [ "$POSTGRES_USERS" ]; then
@@ -79,11 +98,15 @@ if [ "$1" = 'postgres' ]; then
 			EOWARN
 		fi
 
-		{ echo; echo "host all all all $authMethod"; } | gosu postgres tee -a "$PGDATA/pg_hba.conf" > /dev/null
+		{
+			echo
+			echo "host all all all $authMethod"
+		} >> "$PGDATA/pg_hba.conf"
 
 		# internal start of server in order to allow set-up using psql-client		
 		# does not listen on external TCP/IP and waits until start finishes
-		gosu postgres pg_ctl -D "$PGDATA" \
+		PGUSER="${PGUSER:-postgres}" \
+		pg_ctl -D "$PGDATA" \
 			-o "-c listen_addresses='localhost'" \
 			-w start
 
@@ -179,14 +202,13 @@ if [ "$1" = 'postgres' ]; then
 			echo
 		done
 
-		gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop
+		PGUSER="${PGUSER:-postgres}" \
+		pg_ctl -D "$PGDATA" -m fast -w stop
 
 		echo
 		echo 'PostgreSQL init process complete; ready for start up.'
 		echo
 	fi
-
-	exec gosu postgres "$@"
 fi
 
 exec "$@"
